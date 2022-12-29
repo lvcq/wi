@@ -1,16 +1,18 @@
 use std::num::NonZeroU32;
 
+use crate::object::Object;
+
 #[derive(Debug)]
 pub struct State {
     width: u32,
     height: u32,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     texture_size: wgpu::Extent3d,
     output_buffer: wgpu::Buffer,
-    render_pipeline: wgpu::RenderPipeline,
+    objects: Vec<Object>,
 }
 
 impl State {
@@ -43,7 +45,6 @@ impl State {
         let texture = device.create_texture(&texture_desc);
         let texture_view = texture.create_view(&Default::default());
         let output_buffer = Self::create_output_buffer(&device, width, height);
-        let render_pipeline = Self::create_render_pipeline(&device, texture_desc.format.clone());
         Self {
             width,
             height,
@@ -51,9 +52,9 @@ impl State {
             queue,
             texture,
             output_buffer,
-            render_pipeline,
             texture_view,
             texture_size: texture_desc.size,
+            objects: vec![],
         }
     }
 
@@ -70,60 +71,9 @@ impl State {
         output_buffer
     }
 
-    fn create_render_pipeline(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-    ) -> wgpu::RenderPipeline {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[],
-                push_constant_ranges: &[],
-            });
-
-        let binding = [Some(wgpu::ColorTargetState {
-            format,
-            blend: Some(wgpu::BlendState::REPLACE),
-            write_mask: wgpu::ColorWrites::ALL,
-        })];
-        let render_pipeline_desc = wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &binding,
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-        };
-        device.create_render_pipeline(&render_pipeline_desc)
+    pub fn set_objects(&mut self, objects: Vec<Object>) {
+        self.objects = objects;
     }
-
     pub async fn render(&mut self) {
         let mut encoder = self
             .device
@@ -148,9 +98,20 @@ impl State {
                 depth_stencil_attachment: None,
             };
             let mut render_pass = encoder.begin_render_pass(&render_pass_desc);
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw(0..3, 0..1);
+            let count = self.objects.len();
+            let mut index = 0usize;
+            while index < count {
+                let obj = self.objects.get(index).unwrap();
+                render_pass.set_pipeline(obj.render_pipeline.as_ref().unwrap());
+                render_pass.set_bind_group(0, obj.bind_group.as_ref().unwrap(), &[]);
+                render_pass.set_vertex_buffer(0, obj.vertex_buffer.as_ref().unwrap().slice(..));
+                render_pass.set_index_buffer(
+                    obj.index_buffer.as_ref().unwrap().slice(..),
+                    wgpu::IndexFormat::Uint16,
+                );
+                render_pass.draw_indexed(0..obj.num_indices, 0, 0..1);
+                index += 1;
+            }
         }
 
         encoder.copy_texture_to_buffer(
@@ -172,24 +133,22 @@ impl State {
         );
         self.queue.submit(Some(encoder.finish()));
         {
-          let buffer_slice = self.output_buffer.slice(..);
-      
+            let buffer_slice = self.output_buffer.slice(..);
 
-          let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-          buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-              tx.send(result).unwrap();
-          });
-          self.device.poll(wgpu::Maintain::Wait);
-          rx.receive().await.unwrap().unwrap();
-      
-          let data = buffer_slice.get_mapped_range();
-      
-          use image::{ImageBuffer, Rgba};
-          let buffer =
-              ImageBuffer::<Rgba<u8>, _>::from_raw(self.width, self.height, data).unwrap();
-          buffer.save("image.png").unwrap();
-      
-      }
-      self.output_buffer.unmap();
+            let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            rx.receive().await.unwrap().unwrap();
+
+            let data = buffer_slice.get_mapped_range();
+
+            use image::{ImageBuffer, Rgba};
+            let buffer =
+                ImageBuffer::<Rgba<u8>, _>::from_raw(self.width, self.height, data).unwrap();
+            buffer.save("image.png").unwrap();
+        }
+        self.output_buffer.unmap();
     }
 }
